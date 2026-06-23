@@ -14,6 +14,7 @@ export const config = {
   geminiApiKey: process.env.GEMINI_API_KEY,
   geminiModel: process.env.GEMINI_MODEL || 'gemini-2.5-flash',
   logLevel: process.env.LOG_LEVEL || 'info',
+  mongodbUri: process.env.MONGODB_URI || 'mongodb://localhost:27017/kottakkal',
 };
 
 // Validate key configuration parameters
