@@ -8,6 +8,7 @@ import mongoose from 'mongoose';
 import { config } from '../shared/configs/config.js';
 import { logger } from '../shared/utils/logger.js';
 import { runOcrSandbox } from './sandboxRunner.js';
+import { validateDocument } from './validation.js';
 
 // Database Models
 import AiAuditLog from '../shared/models/AiAuditLog.js';
@@ -153,6 +154,153 @@ app.post('/api/ai/ocr/parse', async (req, res, next) => {
         logger.debug('Temporary file deleted successfully.', { filePath });
       } catch (cleanupErr) {
         logger.error(`Failed to clean up temporary file: ${cleanupErr.message}`, { filePath });
+      }
+    }
+  }
+});
+
+/* ==========================================================================
+   OCR Text Validation Endpoint
+   ========================================================================== */
+app.post('/api/ai/ocr/validate', async (req, res, next) => {
+  const { document_type, credentials, extracted_text, file_base64, mime_type, mock, mock_type, timeout_ms } = req.body;
+  const correlationId = req.correlationId;
+
+  if (!document_type || !credentials) {
+    const err = new Error('Missing document_type or credentials parameter.');
+    err.status = 400;
+    return next(err);
+  }
+
+  const validDocTypes = ['tax_receipt', 'property_license', 'building_permit'];
+  if (!validDocTypes.includes(document_type)) {
+    const err = new Error(`Invalid document_type. Must be one of: ${validDocTypes.join(', ')}`);
+    err.status = 400;
+    return next(err);
+  }
+
+  // If mock mode is triggered
+  if (mock) {
+    if (mock_type === 'crash') {
+      const crashErr = new Error('Mock validator crash simulation');
+      crashErr.status = 500;
+      crashErr.errorStage = 'api_gateway';
+      return next(crashErr);
+    }
+    const valid = mock_type === 'success';
+    const responsePayload = {
+      success: true,
+      valid,
+      score: valid ? 1.0 : 0.45,
+      matches: {
+        id: valid,
+        name: valid,
+        amount: valid,
+        date: valid
+      },
+      details: {
+        extracted: {
+          id: valid ? credentials.id : 'MOCK-WRONG-ID',
+          name: valid ? credentials.name : 'MOCK-WRONG-NAME',
+          amount: valid ? credentials.amount : 0,
+          date: valid ? credentials.date : '2000-01-01'
+        },
+        expected: credentials
+      }
+    };
+    
+    // Log Mock Telemetry
+    mockDb.auditLogs.push({
+      _id: new mongoose.Types.ObjectId(),
+      action_type: 'document_validation',
+      service_name: 'ocr_service',
+      model_name: 'regex-levenshtein-validator',
+      confidence_score: responsePayload.score,
+      policy_decision: valid ? 'allowed' : 'blocked',
+      correlation_id: correlationId,
+      created_at: new Date()
+    });
+
+    return res.json(responsePayload);
+  }
+
+  let filePath = '';
+  try {
+    let textToValidate = extracted_text || '';
+
+    // If base64 file is provided, run parsing sandbox first
+    if (!textToValidate && file_base64) {
+      if (!mime_type) {
+        const err = new Error('Missing mime_type for parsing file input.');
+        err.status = 400;
+        return next(err);
+      }
+      const ext = mime_type === 'application/pdf' ? 'pdf' : 'img';
+      const fileNameUnique = `ocr_val_${Date.now()}_${crypto.randomBytes(4).toString('hex')}.${ext}`;
+      filePath = path.resolve(tempDir, fileNameUnique);
+      const buffer = Buffer.from(file_base64, 'base64');
+      fs.writeFileSync(filePath, buffer);
+
+      const timeoutVal = timeout_ms || 30000;
+      textToValidate = await runOcrSandbox(filePath, mime_type, {
+        mock: false,
+        timeoutMs: timeoutVal
+      });
+    }
+
+    if (!textToValidate) {
+      const err = new Error('Missing text input to validate (extracted_text or file_base64 is required).');
+      err.status = 400;
+      return next(err);
+    }
+
+    // Run Levenshtein and Regex validation checks
+    const valResult = validateDocument(textToValidate, document_type, credentials);
+
+    // Log Telemetry Audit Log
+    if (isDbConnected()) {
+      const auditLog = new AiAuditLog({
+        action_type: 'document_validation',
+        service_name: 'ocr_service',
+        model_name: 'regex-levenshtein-validator',
+        confidence_score: valResult.score,
+        policy_decision: valResult.valid ? 'allowed' : 'blocked',
+        safety_flag: !valResult.valid,
+        operational_entity_type: 'document',
+        correlation_id: correlationId,
+        pii_redaction_applied: false
+      });
+      await auditLog.save();
+    } else {
+      mockDb.auditLogs.push({
+        _id: new mongoose.Types.ObjectId(),
+        action_type: 'document_validation',
+        service_name: 'ocr_service',
+        model_name: 'regex-levenshtein-validator',
+        confidence_score: valResult.score,
+        policy_decision: valResult.valid ? 'allowed' : 'blocked',
+        correlation_id: correlationId,
+        created_at: new Date()
+      });
+    }
+
+    res.json({
+      success: true,
+      valid: valResult.valid,
+      score: valResult.score,
+      matches: valResult.matches,
+      details: valResult.details
+    });
+
+  } catch (error) {
+    error.errorStage = 'api_gateway';
+    next(error);
+  } finally {
+    if (filePath && fs.existsSync(filePath)) {
+      try {
+        fs.unlinkSync(filePath);
+      } catch (cleanupErr) {
+        logger.error(`Failed to clean up validation file: ${cleanupErr.message}`, { filePath });
       }
     }
   }
