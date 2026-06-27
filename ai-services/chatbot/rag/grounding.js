@@ -74,12 +74,15 @@ export const groundingMiddleware = (req, res, next) => {
     }
   });
 
-  logger.info(`RAG grounding complete. Found ${contextChunks.length} matching knowledge chunks.`, { 
+  // Limit to maximum of 2 chunks to reduce payload size and latency
+  const finalChunks = contextChunks.slice(0, 2);
+
+  logger.info(`RAG grounding complete. Found ${finalChunks.length} matching knowledge chunks.`, { 
     correlationId, 
-    matchedSourceIds: contextChunks.map(c => c.sourceId) 
+    matchedSourceIds: finalChunks.map(c => c.sourceId) 
   });
 
   // Attach grounding results to the request object
-  req.ragContext = contextChunks;
+  req.ragContext = finalChunks;
   next();
 };

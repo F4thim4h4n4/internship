@@ -5,6 +5,7 @@ import { SYSTEM_INSTRUCTION, RESPONSE_SCHEMA, formatGroundedPrompt } from './pro
 
 // Initialize the Google Gen AI client lazily
 let aiInstance = null;
+let activePromptCache = null;
 
 const getAiInstance = () => {
   if (!aiInstance) {
@@ -18,6 +19,39 @@ const getAiInstance = () => {
     aiInstance = new GoogleGenAI({ apiKey: config.geminiApiKey });
   }
   return aiInstance;
+};
+
+// Static representation of municipal approved documents to cache as prefix context
+const MUNICIPAL_DOCS_CONTEXT = `Kottakkal Municipality Official Documents:
+- kb_001: Kottakkal Municipality collects organic waste (food and wet waste) on Mondays and Wednesdays. Inorganic/recyclable waste (plastic, paper, glass) is collected on Fridays. Hazardous waste is collected on the first Saturday of every month. Public street bins are cleared daily starting at 6:00 AM.
+- kb_002: For building permit approval in Kottakkal, citizens must submit: 1. Completed application form. 2. Property deed / possession certificate. 3. Structural plans signed by a registered engineer. 4. Land tax receipts for the current year. Applications are processed within 30 days.
+- kb_003: Property tax in Kottakkal can be paid online via the Sanchaya portal (sanchaya.lsgkerala.gov.in) or physically at the municipal office counter. The annual payment deadline to avoid a 1% monthly penalty is September 30th.
+- kb_004: The Kottakkal Municipal Office is located at Main Road, Kottakkal. Working hours are Monday to Saturday, 10:00 AM to 5:00 PM (closed on Sundays and public holidays). Key contacts: Chairman: 0483-2742031, Secretary: 0483-2742033, Health Section: 0483-2742032.`;
+
+/**
+ * Lazy explicit caching creator/fetcher for system prompts and municipal files
+ */
+const getOrCreatePromptCache = async (ai, correlationId) => {
+  if (activePromptCache) {
+    return activePromptCache;
+  }
+  try {
+    logger.info('Creating new Explicit Prompt Cache for chatbot...', { correlationId });
+    const cache = await ai.caches.create({
+      model: config.geminiModel,
+      config: {
+        contents: [MUNICIPAL_DOCS_CONTEXT],
+        systemInstruction: SYSTEM_INSTRUCTION,
+        ttl: "300s" // 5 mins TTL
+      }
+    });
+    activePromptCache = cache;
+    logger.info(`Prompt cache created successfully: ${cache.name}`, { correlationId, cacheName: cache.name });
+    return activePromptCache;
+  } catch (error) {
+    logger.warn(`Failed to create explicit prompt cache: ${error.message}. Proceeding without caching.`, { correlationId });
+    return null;
+  }
 };
 
 /**
@@ -109,15 +143,16 @@ export const generateGroundedResponse = async (query, contextChunks, correlation
       };
     }
 
-    logger.info('Simulated Gemini API call successful (MOCK mode)', {
+    logger.info('Simulated Gemini API call successful (MOCK mode) with prompt caching', {
       correlationId,
       event: 'gemini_response_mock',
       aiModel: 'mock-gemini-model',
       durationMs,
-      promptTokens: 50,
+      promptTokens: 20, // Compressed tokens
       candidatesTokens: 40,
-      totalTokens: 90,
-      retrievalKbIds: contextChunks.map(c => c.sourceId)
+      totalTokens: 60,
+      retrievalKbIds: contextChunks.map(c => c.sourceId),
+      cacheHit: true
     });
 
     return {
@@ -126,9 +161,10 @@ export const generateGroundedResponse = async (query, contextChunks, correlation
       meta: {
         model: 'mock-gemini-model',
         durationMs,
-        tokens: { prompt: 50, completion: 40, total: 90 },
+        tokens: { prompt: 20, completion: 40, total: 60 },
         retrievalKbIds: contextChunks.map(c => c.sourceId),
-        mock: true
+        mock: true,
+        cacheHit: true
       }
     };
   }
@@ -137,39 +173,68 @@ export const generateGroundedResponse = async (query, contextChunks, correlation
     const ai = getAiInstance();
     const formattedPrompt = formatGroundedPrompt(query, contextChunks);
 
+    // Try to retrieve or create the cache (explicit caching of static guidelines)
+    let cache = null;
+    if (ai) {
+      cache = await getOrCreatePromptCache(ai, correlationId);
+    }
+
     const callApi = async () => {
+      const apiConfig = {
+        temperature: 0.1, // low temperature to ensure strict factuality
+        responseMimeType: "application/json",
+        responseSchema: RESPONSE_SCHEMA,
+        safetySettings: [
+          {
+            category: "HARM_CATEGORY_HARASSMENT",
+            threshold: "BLOCK_MEDIUM_AND_ABOVE"
+          },
+          {
+            category: "HARM_CATEGORY_HATE_SPEECH",
+            threshold: "BLOCK_MEDIUM_AND_ABOVE"
+          },
+          {
+            category: "HARM_CATEGORY_SEXUALLY_EXPLICIT",
+            threshold: "BLOCK_MEDIUM_AND_ABOVE"
+          },
+          {
+            category: "HARM_CATEGORY_DANGEROUS_CONTENT",
+            threshold: "BLOCK_MEDIUM_AND_ABOVE"
+          }
+        ]
+      };
+
+      if (cache) {
+        // Bind to created prompt cache and omit guidelines/system instructions from body parameter payload
+        apiConfig.cachedContent = cache.name;
+      } else {
+        // Standard parameters fallback
+        apiConfig.systemInstruction = SYSTEM_INSTRUCTION;
+      }
+
       return await ai.models.generateContent({
         model: config.geminiModel,
         contents: formattedPrompt,
-        config: {
-          systemInstruction: SYSTEM_INSTRUCTION,
-          temperature: 0.1, // low temperature to ensure strict factuality
-          responseMimeType: "application/json",
-          responseSchema: RESPONSE_SCHEMA,
-          safetySettings: [
-            {
-              category: "HARM_CATEGORY_HARASSMENT",
-              threshold: "BLOCK_MEDIUM_AND_ABOVE"
-            },
-            {
-              category: "HARM_CATEGORY_HATE_SPEECH",
-              threshold: "BLOCK_MEDIUM_AND_ABOVE"
-            },
-            {
-              category: "HARM_CATEGORY_SEXUALLY_EXPLICIT",
-              threshold: "BLOCK_MEDIUM_AND_ABOVE"
-            },
-            {
-              category: "HARM_CATEGORY_DANGEROUS_CONTENT",
-              threshold: "BLOCK_MEDIUM_AND_ABOVE"
-            }
-          ]
-        }
+        config: apiConfig
       });
     };
 
     // Run the API call with up to 3 retries (total 4 attempts)
-    const response = await retryWithBackoff(callApi, 3, 1000, correlationId);
+    let response;
+    try {
+      response = await retryWithBackoff(callApi, 3, 1000, correlationId);
+    } catch (apiErr) {
+      // Re-create cache if API throws cache expired / not found error
+      if (cache && (apiErr.message.includes('expired') || apiErr.message.includes('not found') || apiErr.message.includes('Invalid argument'))) {
+        logger.warn('Prompt cache expired or invalid. Re-creating and retrying query...', { correlationId });
+        activePromptCache = null; // force recreation
+        cache = await getOrCreatePromptCache(ai, correlationId);
+        response = await retryWithBackoff(callApi, 3, 1000, correlationId);
+      } else {
+        throw apiErr;
+      }
+    }
+
     const endTime = Date.now();
     const durationMs = endTime - startTime;
 
@@ -189,12 +254,10 @@ export const generateGroundedResponse = async (query, contextChunks, correlation
     let verificationErrorReason = '';
 
     if (parsedResult.grounded === true) {
-      // 1. Ensure sourcesUsed is not empty if grounded is true
       if (!parsedResult.sourcesUsed || parsedResult.sourcesUsed.length === 0) {
         verificationPassed = false;
         verificationErrorReason = 'Response claimed to be grounded but cited no sources.';
       } else {
-        // 2. Ensure all cited sources actually exist in contextChunks
         for (const citedId of parsedResult.sourcesUsed) {
           if (!validSourceIds.includes(citedId)) {
             verificationPassed = false;
@@ -213,7 +276,7 @@ export const generateGroundedResponse = async (query, contextChunks, correlation
         validSources: validSourceIds
       });
 
-      // Override the response with safe fallback values to prevent hallucination leakage
+      // Override response with safe fallback values
       const isMalayalam = /[\u0D00-\u0D7F]/.test(query);
       parsedResult = {
         response: isMalayalam 
@@ -230,6 +293,7 @@ export const generateGroundedResponse = async (query, contextChunks, correlation
     const promptTokens = usageMetadata.promptTokenCount || 0;
     const candidatesTokens = usageMetadata.candidatesTokenCount || 0;
     const totalTokens = usageMetadata.totalTokenCount || 0;
+    const cachedPromptCharacters = usageMetadata.cachedContentCharactersCount || 0;
 
     // Log AI Audit Log (corresponds to ai_audit_logs collection schema)
     logger.info('Gemini API call successful', {
@@ -241,7 +305,8 @@ export const generateGroundedResponse = async (query, contextChunks, correlation
       candidatesTokens,
       totalTokens,
       retrievalKbIds: contextChunks.map(c => c.sourceId),
-      groundingVerified: verificationPassed
+      groundingVerified: verificationPassed,
+      cacheHit: cachedPromptCharacters > 0
     });
 
     return {
@@ -253,10 +318,12 @@ export const generateGroundedResponse = async (query, contextChunks, correlation
         tokens: {
           prompt: promptTokens,
           completion: candidatesTokens,
-          total: totalTokens
+          total: totalTokens,
+          cachedCharacters: cachedPromptCharacters
         },
         retrievalKbIds: contextChunks.map(c => c.sourceId),
-        groundingVerified: verificationPassed
+        groundingVerified: verificationPassed,
+        cacheHit: cachedPromptCharacters > 0
       }
     };
 
@@ -264,7 +331,6 @@ export const generateGroundedResponse = async (query, contextChunks, correlation
     const endTime = Date.now();
     const durationMs = endTime - startTime;
 
-    // Log AI Error Log (corresponds to ai_errors collection schema)
     logger.error('Gemini API call failed', {
       correlationId,
       event: 'gemini_error',
