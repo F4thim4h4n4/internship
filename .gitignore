@@ -5,14 +5,40 @@ __pycache__/
 .venv/
 venv/
 
-# Environment and secrets
+# Environment Files
 .env
-.env.*
+.env.local
+.env.development
+.env.production
+.env.test
 !.env.example
+
+# Backend
+backend/.env
+backend/.env.*
+!backend/.env.example
+
+# Frontend
+frontend/.env
+frontend/.env.*
+!frontend/.env.example
+
+# AI Services
+ai-service/.env
+ai-service/.env.*
+!ai-service/.env.example
+ai-services/.env
+ai-services/.env.*
+!ai-services/.env.example
+
+# Secrets
 *.pem
 *.key
+*.crt
 *.p12
 *.pfx
+secrets/
+credentials/
 
 # Build outputs
 dist/
