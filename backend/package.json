@@ -4,7 +4,8 @@
   "private": true,
   "description": "Node.js backend workspace for the AI-powered smart municipal citizen assistance and staff attendance management system.",
   "scripts": {
-    "test": "node --test tests/user.test.js",
+    "test": "node --test tests/*.test.js",
+    "seed:roles": "node seed/seedRoles.js",
     "seed:admin": "node seed/seedAdmin.js"
   },
   "dependencies": {

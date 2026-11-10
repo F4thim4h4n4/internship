@@ -44,9 +44,12 @@ const BCRYPT_SALT_ROUNDS = parseInt(process.env.BCRYPT_SALT_ROUNDS, 10) || 12;
 async function resolveAdminRole(connection) {
   const rolesCollection = connection.collection('roles');
 
-  // Search for standard administrator role names
+  // Search for standard administrator role by name or code
   let role = await rolesCollection.findOne({
-    name: { $in: ['Administrator', 'Admin', 'admin', 'administrator'] },
+    $or: [
+      { code: { $in: ['ADMIN', 'ADMINISTRATOR', 'SUPER_ADMIN'] } },
+      { name: { $in: ['Admin', 'Administrator', 'admin', 'administrator', 'Super Admin'] } },
+    ],
   });
 
   if (!role) {
@@ -54,8 +57,10 @@ async function resolveAdminRole(connection) {
     const now = new Date();
     const result = await rolesCollection.insertOne({
       name: 'Administrator',
+      code: 'ADMIN',
       description: 'System Administrator with full municipal access',
       permissions: ['*'],
+      isActive: true,
       createdAt: now,
       updatedAt: now,
     });
